@@ -4,7 +4,7 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
-from .ipf import ipf_perfiles, ipf_perfiles_gpu
+from .ipf import ipf_perfiles, ipf_perfiles_gpu, ipf_perfiles_gpu_rapido
 
 
 def construir_perfiles(codigos_persona):
@@ -45,6 +45,7 @@ def _preparar(inv, bloques, previo):
 
 
 def _errores(bloques, perfiles, nus, W, mu_p):
+    W = W.astype(np.float64, copy=False)  # si W viene en float32, se acumula en doble precisión
     errores = {}
     for j, (b, nu_k) in enumerate(zip(bloques, nus)):
         proj, ok = indicadora(perfiles[:, j], nu_k.shape[0]) @ W, ~np.isnan(nu_k)
@@ -63,12 +64,14 @@ def ajustar_modelo(inv, bloques, previo=None, n_iter=200000, tol=1e-10):
             "errores": _errores(bloques, perfiles, nus, W, mu_p)}
 
 
-def ajustar_modelo_gpu(inv, bloques, previo=None, tol=1e-6, n_iter=200000, reportar=None):
-    # IPF en GPU sobre los perfiles de `bloques` (criterio: error marginal máximo <= tol personas)
+def ajustar_modelo_gpu(inv, bloques, previo=None, tol=1e-6, n_iter=200000, reportar=None, rapido=False):
+    # IPF en GPU sobre los perfiles de `bloques` (criterio: error marginal máximo <= tol personas).
+    # rapido=True usa ipf_perfiles_gpu_rapido (W en float32, kernels propios)
     nus, perfiles, perfil_de_persona, mu_p, W0 = _preparar(inv, bloques, previo)
     t0 = time.time()
-    W, it, conv, _ = ipf_perfiles_gpu(mu_p, [perfiles[:, j] for j in range(len(bloques))], nus,
-                                      tol=tol, n_iter=n_iter, W0=W0, reportar=reportar)
+    solver = ipf_perfiles_gpu_rapido if rapido else ipf_perfiles_gpu
+    W, it, conv, _ = solver(mu_p, [perfiles[:, j] for j in range(len(bloques))], nus,
+                            tol=tol, n_iter=n_iter, W0=W0, reportar=reportar)
     return {"bloques": list(bloques), "W": W, "perfiles": perfiles, "perfil_de_persona": perfil_de_persona,
             "mu_p": mu_p, "iteraciones": it, "convergio": conv, "segundos": time.time() - t0,
             "errores": _errores(bloques, perfiles, nus, W, mu_p)}
@@ -78,6 +81,19 @@ def errores_modelo(inv, modelo):
     # Error marginal máximo por bloque (y filas mu_p) de un modelo, ajustado o cargado desde disco
     nus = [codigos_bloque(inv, b)[1] for b in modelo["bloques"]]
     return _errores(modelo["bloques"], modelo["perfiles"], nus, modelo["W"], modelo["mu_p"])
+
+
+def error_relativo_modelo(inv, modelo, tol, tol_rel):
+    # Máximo de |error| / max(tol, tol_rel * tamaño) sobre todas las celdas restringidas (tamaño = n_per de la
+    # manzana) y filas (tamaño = mu_p). <= 1 significa que el modelo cumple el criterio de convergencia
+    W = modelo["W"].astype(np.float64, copy=False)
+    permitido = np.maximum(tol, tol_rel * inv.nu)[None, :]
+    e = [np.max(np.abs(W.sum(axis=1) - modelo["mu_p"]) / np.maximum(tol, tol_rel * modelo["mu_p"]))]
+    for j, b in enumerate(modelo["bloques"]):
+        nu_k = codigos_bloque(inv, b)[1]
+        proj, ok = indicadora(modelo["perfiles"][:, j], nu_k.shape[0]) @ W, ~np.isnan(nu_k)
+        e.append(np.max((np.abs(proj - nu_k) / permitido)[ok]))
+    return float(max(e))
 
 
 def predecir_bloque(inv, modelo, bloque):
@@ -94,13 +110,17 @@ def proyectar(modelo, bloque, C):
 
 
 def guardar_modelo(modelo, ruta):
+    # tol y tol_rel (criterio con que se ajustó) son opcionales; NaN si el modelo no los trae
     np.savez(ruta, W=modelo["W"], perfiles=modelo["perfiles"], perfil_de_persona=modelo["perfil_de_persona"],
              mu_p=modelo["mu_p"], bloques=np.array(modelo["bloques"]), iteraciones=modelo["iteraciones"],
-             convergio=modelo["convergio"], segundos=modelo["segundos"])
+             convergio=modelo["convergio"], segundos=modelo["segundos"],
+             tol=modelo.get("tol", np.nan), tol_rel=modelo.get("tol_rel", np.nan))
 
 
 def cargar_modelo(ruta):
     z = np.load(ruta)
     return {"bloques": z["bloques"].tolist(), "W": z["W"], "perfiles": z["perfiles"],
             "perfil_de_persona": z["perfil_de_persona"], "mu_p": z["mu_p"], "iteraciones": int(z["iteraciones"]),
-            "convergio": bool(z["convergio"]), "segundos": float(z["segundos"])}
+            "convergio": bool(z["convergio"]), "segundos": float(z["segundos"]),
+            "tol": float(z["tol"]) if "tol" in z.files else np.nan,
+            "tol_rel": float(z["tol_rel"]) if "tol_rel" in z.files else np.nan}

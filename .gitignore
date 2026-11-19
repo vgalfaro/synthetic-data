@@ -6,3 +6,10 @@ priori
 output.png
 resultados
 __pycache__
+# estado de ejecución del planificador del clúster
+cluster/estado.json
+cluster/*.log
+cluster/*.out
+cluster/*.pid
+# documentos de trabajo (contexto, sesiones, informe, referencias)
+docs/

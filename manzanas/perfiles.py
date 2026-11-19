@@ -60,7 +60,7 @@ def ajustar_modelo(inv, bloques, previo=None, n_iter=200000, tol=1e-10):
     t0 = time.time()
     W, it, conv = ipf_perfiles(mu_p, [perfiles[:, j] for j in range(len(bloques))], nus, n_iter=n_iter, tol=tol, W0=W0)
     return {"bloques": list(bloques), "W": W, "perfiles": perfiles, "perfil_de_persona": perfil_de_persona,
-            "mu_p": mu_p, "iteraciones": it, "convergio": conv, "segundos": time.time() - t0,
+            "mu_p": mu_p, "nu_m": inv.nu, "iteraciones": it, "convergio": conv, "segundos": time.time() - t0,
             "errores": _errores(bloques, perfiles, nus, W, mu_p)}
 
 
@@ -73,7 +73,7 @@ def ajustar_modelo_gpu(inv, bloques, previo=None, tol=1e-6, n_iter=200000, repor
     W, it, conv, _ = solver(mu_p, [perfiles[:, j] for j in range(len(bloques))], nus,
                             tol=tol, n_iter=n_iter, W0=W0, reportar=reportar)
     return {"bloques": list(bloques), "W": W, "perfiles": perfiles, "perfil_de_persona": perfil_de_persona,
-            "mu_p": mu_p, "iteraciones": it, "convergio": conv, "segundos": time.time() - t0,
+            "mu_p": mu_p, "nu_m": inv.nu, "iteraciones": it, "convergio": conv, "segundos": time.time() - t0,
             "errores": _errores(bloques, perfiles, nus, W, mu_p)}
 
 
@@ -110,9 +110,11 @@ def proyectar(modelo, bloque, C):
 
 
 def guardar_modelo(modelo, ruta):
-    # tol y tol_rel (criterio con que se ajustó) son opcionales; NaN si el modelo no los trae
+    # tol y tol_rel (criterio con que se ajustó) son opcionales; NaN si el modelo no los trae.
+    # nu_m (total de unidades por manzana, columnas de W) es opcional; vacío si el modelo no lo trae
+    nu_m = modelo.get("nu_m")
     np.savez(ruta, W=modelo["W"], perfiles=modelo["perfiles"], perfil_de_persona=modelo["perfil_de_persona"],
-             mu_p=modelo["mu_p"], bloques=np.array(modelo["bloques"]), iteraciones=modelo["iteraciones"],
+             mu_p=modelo["mu_p"], nu_m=np.asarray([] if nu_m is None else nu_m), bloques=np.array(modelo["bloques"]), iteraciones=modelo["iteraciones"],
              convergio=modelo["convergio"], segundos=modelo["segundos"],
              tol=modelo.get("tol", np.nan), tol_rel=modelo.get("tol_rel", np.nan))
 
@@ -120,7 +122,8 @@ def guardar_modelo(modelo, ruta):
 def cargar_modelo(ruta):
     z = np.load(ruta)
     return {"bloques": z["bloques"].tolist(), "W": z["W"], "perfiles": z["perfiles"],
-            "perfil_de_persona": z["perfil_de_persona"], "mu_p": z["mu_p"], "iteraciones": int(z["iteraciones"]),
+            "perfil_de_persona": z["perfil_de_persona"], "mu_p": z["mu_p"],
+            "nu_m": z["nu_m"] if "nu_m" in z.files and z["nu_m"].size else None, "iteraciones": int(z["iteraciones"]),
             "convergio": bool(z["convergio"]), "segundos": float(z["segundos"]),
             "tol": float(z["tol"]) if "tol" in z.files else np.nan,
             "tol_rel": float(z["tol_rel"]) if "tol_rel" in z.files else np.nan}

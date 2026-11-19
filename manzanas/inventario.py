@@ -1,4 +1,7 @@
-"""Inventario de marginales de personas por manzana: mapeo diccionario -> microdato, verificado contra los totales.
+"""Inventario de marginales por manzana: mapeo diccionario -> microdato, verificado contra los totales.
+
+Aquí está el mapeo de personas; los de hogares y viviendas están en manzanas/unidades.py y usan la misma verificación
+(inventario_tabla).
 
 Fuentes: diccionario_variables_glosas_censo2024_manzana_agregados.xlsx (columnas de manzana) y
 diccionario_variables_censo2024_nivel_comuna.xlsx (códigos del microdato).
@@ -51,24 +54,30 @@ MAPEO_PERSONAS = {
 
 @dataclass
 class Inventario:
-    per: pd.DataFrame     # variables de persona que usan los bloques (+ p37_alfabet_15)
+    per: pd.DataFrame     # tabla de unidades con las variables que usan los bloques (personas: + p37_alfabet_15;
+                          # hogares y viviendas: ver manzanas/unidades.py). Se llama `per` por compatibilidad
     marginales: dict      # bloque -> {"variable", "categorias", "nu" (C_k, M)}
-    nu: np.ndarray        # n_per por manzana
+    nu: np.ndarray        # total de unidades por manzana (n_per, n_hog o n_vp)
     tabla: pd.DataFrame   # por columna: total comunal vs suma de manzanas no enmascaradas
 
 
 def construir_inventario(datos, mapeo=MAPEO_PERSONAS):
-    # Lee cada marginal publicado y verifica: exacto si no tiene '*', residuo >= 0 si lo tiene,
-    # y las categorías publicadas no exceden n_per
+    # Inventario de personas: agrega p37_alfabet_15 y verifica los marginales (ver inventario_tabla)
     cols = sorted({v for v, _ in mapeo.values()} - {"p37_alfabet_15"} | {"p37_alfabet"})
     per = datos.personas[cols].copy()
     per["p37_alfabet_15"] = per["p37_alfabet"].where(per["edad"] >= 15)
+    return inventario_tabla(per, datos, mapeo)
 
+
+def inventario_tabla(tabla, datos, mapeo):
+    # Lee cada marginal publicado y verifica contra la tabla de unidades (personas, hogares o viviendas) de la comuna:
+    # exacto si no tiene '*', residuo >= 0 si lo tiene, y las categorías publicadas no exceden el total de la manzana
+    # (datos.nu: n_per, n_hog o n_vp según la unidad)
     marginales, filas = {}, []
     for bloque, (var, categorias) in mapeo.items():
         nu_k = np.vstack([leer_marginal(datos, col) for col, _ in categorias])  # (C_k, M)
         for (col, codigos), fila_nu in zip(categorias, nu_k):
-            total_comuna = int(per[var].isin(codigos).sum())
+            total_comuna = int(tabla[var].isin(codigos).sum())
             n_masc = int(np.isnan(fila_nu).sum())
             residuo = total_comuna - np.nansum(fila_nu)
             filas.append({"bloque": bloque, "columna": col, "variable": var,
@@ -79,7 +88,7 @@ def construir_inventario(datos, mapeo=MAPEO_PERSONAS):
         ok = ~np.isnan(nu_k).any(axis=0)
         assert (nu_k[:, ok].sum(axis=0) <= datos.nu[ok]).all(), bloque
         marginales[bloque] = {"variable": var, "categorias": categorias, "nu": nu_k}
-    return Inventario(per, marginales, datos.nu, pd.DataFrame(filas))
+    return Inventario(tabla, marginales, datos.nu, pd.DataFrame(filas))
 
 
 def etiquetas_bloque(inv, bloque):

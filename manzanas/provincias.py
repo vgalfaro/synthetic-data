@@ -3,7 +3,8 @@
 A nivel de comuna el microdato trae la verdad de cualquier cruce. Se repite el experimento un nivel más arriba:
 la conjunta de la provincia es conocida y de cada comuna solo se usan los mismos 82 marginales univariados que el INE
 publica por manzana (calculados desde el microdato). Se ajusta el mismo modelo de 27 bloques y se comparan los
-cruces estimados por comuna contra los reales, junto con tres alternativas:
+cruces estimados por comuna contra los reales, junto con tres alternativas (lo mismo para hogares y viviendas con
+datos_provincia_unidad y ajustar_provincia(..., unidad=)):
     independencia   el cruce sale solo de los dos marginales de la comuna: fila x columna / n
     provincial      la estructura del cruce en la provincia, escalada al tamaño de la comuna (ignora sus marginales)
     raking_2        el cruce provincial ajustado (IPF) a los dos marginales de la comuna: usa la provincia y los dos
@@ -16,10 +17,11 @@ import numpy as np
 import pandas as pd
 
 from .datos import DatosComuna, ruta_comuna
-from .inventario import MAPEO_PERSONAS, construir_inventario, etiquetas_bloque
+from .inventario import MAPEO_PERSONAS, construir_inventario, etiquetas_bloque, inventario_tabla
 from .ipf import ipf_perfiles_gpu_rapido
 from .pais import RUTA_COMUNAS
 from .perfiles import _preparar, cargar_modelo, codigos_bloque, errores_modelo, guardar_modelo, indicadora
+from .unidades import MAPEOS, TOTAL, DatosUnidad, tabla_unidad
 
 RUTA_VALIDACION = os.path.join("resultados", "validacion")
 METODOS = ["modelo", "raking_2", "independencia", "provincial"]
@@ -31,6 +33,19 @@ NIVEL_2 = {
     "pueblo específico": ("p28_pueblo_pert", "pueblo"),
     "años de escolaridad": ("escolaridad", "cine"),
     "parentesco": ("parentesco", "edad"),
+}
+# Lo mismo para hogares y viviendas: variables de la unidad sin marginal por manzana
+NIVEL_2_UNIDADES = {
+    "hogares": {
+        "tipología del hogar": ("tipologia_hogar", "unipersonal"),
+        "personas por hogar (tope 8)": ("n_personas_8", "unipersonal"),
+    },
+    "viviendas": {
+        "estado de ocupación detallado": ("p3b_estado_ocupacion", "ocupacion"),
+        "hacinamiento (3 niveles)": ("indice_hacinamiento", "hacinamiento"),
+        "personas por vivienda (tope 8)": ("cant_per_8", "dormitorios"),
+        "hogares por vivienda": ("cant_hog", "ocupacion"),
+    },
 }
 _COLS_PERSONA = sorted({v for v, _ in MAPEO_PERSONAS.values()} - {"p37_alfabet_15"}
                        | {"p37_alfabet", "comuna", "provincia"} | {c for c, _ in NIVEL_2.values()})
@@ -64,20 +79,38 @@ def datos_provincia(prov, comunas, nombres):
     return DatosComuna(prov, personas, manzanas, np.asarray(comunas), manzanas["n_per"].to_numpy())
 
 
-def ajustar_provincia(datos, tol=0.1, tol_rel=1e-4, n_iter=20000, reajustar=False):
-    # Mismo ajuste y mismo criterio que la corrida nacional (27 bloques, IPF rápido en GPU), con las comunas como manzanas
-    os.makedirs(os.path.join(RUTA_VALIDACION, "modelos"), exist_ok=True)
-    inv = construir_inventario(datos)
+def datos_provincia_unidad(prov, comunas, nombres, unidad):
+    # Como datos_provincia, para hogares o viviendas: une las tablas de la unidad de las comunas de la provincia y arma
+    # para cada comuna los marginales de manzana de la unidad (exactos). Las comunas sin unidades se omiten
+    tablas = [tabla_unidad(c, unidad, RUTA_COMUNAS) for c in comunas]
+    comunas = [c for c, t in zip(comunas, tablas) if len(t)]
+    tabla = pd.concat([t for t in tablas if len(t)], ignore_index=True)
+    grupos = tabla["comuna"]
+    filas = {"MANZENT": comunas, "COMUNA": [nombres[c] for c in comunas],
+             TOTAL[unidad]: grupos.value_counts().reindex(comunas).to_numpy()}
+    for var, categorias in MAPEOS[unidad].values():
+        for col, codigos in categorias:
+            filas[col] = tabla[var].isin(codigos).groupby(grupos).sum().reindex(comunas, fill_value=0).to_numpy()
+    manzanas = pd.DataFrame(filas)
+    return DatosUnidad(prov, unidad, tabla, manzanas, np.asarray(comunas), manzanas[TOTAL[unidad]].to_numpy())
+
+
+def ajustar_provincia(datos, tol=0.1, tol_rel=1e-4, n_iter=20000, reajustar=False, unidad="personas"):
+    # Mismo ajuste y mismo criterio que la corrida nacional (todos los bloques de la unidad, IPF rápido en GPU), con
+    # las comunas como manzanas. Los modelos de hogares y viviendas van a resultados/validacion/<unidad>/modelos/
+    carpeta = os.path.join(RUTA_VALIDACION, "modelos") if unidad == "personas" else os.path.join(RUTA_VALIDACION, unidad, "modelos")
+    os.makedirs(carpeta, exist_ok=True)
+    inv = construir_inventario(datos) if unidad == "personas" else inventario_tabla(datos.tabla, datos, MAPEOS[unidad])
     bloques = list(inv.marginales)
-    ruta = os.path.join(RUTA_VALIDACION, "modelos", f"modelo_prov_{datos.cut}.npz")
+    ruta = os.path.join(carpeta, f"modelo_prov_{datos.cut}.npz")
     modelo = cargar_modelo(ruta) if os.path.exists(ruta) and not reajustar else None
-    if modelo is None or (modelo["tol"], modelo["tol_rel"]) != (tol, tol_rel):
+    if modelo is None or (modelo["tol"], modelo["tol_rel"]) != (tol, tol_rel) or modelo["bloques"] != bloques:
         nus, perfiles, perfil_de_persona, mu_p, _ = _preparar(inv, bloques, None)
         t0 = time.time()
         W, it, conv, _ = ipf_perfiles_gpu_rapido(mu_p, [perfiles[:, j] for j in range(len(bloques))], nus, tol=tol,
                                                  tol_rel=tol_rel, n_per=datos.nu, n_iter=n_iter)
         modelo = {"bloques": bloques, "W": W, "perfiles": perfiles, "perfil_de_persona": perfil_de_persona,
-                  "mu_p": mu_p, "iteraciones": it, "convergio": conv, "segundos": time.time() - t0,
+                  "mu_p": mu_p, "nu_m": datos.nu, "iteraciones": it, "convergio": conv, "segundos": time.time() - t0,
                   "tol": tol, "tol_rel": tol_rel}
         guardar_modelo(modelo, ruta)
     return inv, modelo
@@ -145,24 +178,25 @@ def celda_por_comuna(datos, inv, modelo, var1, cat1, var2, cat2):
                          **{k: v[i1, i2] for k, v in alt.items()}})
 
 
-def _codigo_nivel_2(personas, nombre):
-    col = NIVEL_2[nombre][0]
+def _codigo_nivel_2(personas, nombre, col):
     x = personas[col]
     if nombre == "país de nacimiento":  # los nacidos en Chile traen el código de su comuna de nacimiento
         x = x.where(x < 1000, 1)  # 1 = Chile; el resto son códigos de país; -99 no responde
     return pd.factorize(x.fillna(0))[0]  # NaN (no aplica / no pertenece) = una categoría más
 
 
-def evaluar_nivel_2(datos, inv, modelo):
-    # Variables sin marginal por manzana: cada persona hereda el reparto de su perfil (extensión del modelo) vs
+def evaluar_nivel_2(datos, inv, modelo, variables=None):
+    # Variables sin marginal por manzana: cada unidad hereda el reparto de su perfil (extensión del modelo) vs
     #   proporcional        n de la comuna x distribución provincial
     #   condicional_1       solo el bloque relacionado: sum_c nu[c, comuna] x P_provincia(y | c)
+    # variables: nombre -> (columna, bloque relacionado); por omisión NIVEL_2 (personas)
+    variables = NIVEL_2 if variables is None else variables
     M, n = len(datos.nu), datos.nu.astype(float)
     idx = pd.Index(datos.manzanas_ids).get_indexer(datos.personas["comuna"])
     reparto = modelo["W"].astype(np.float64) / modelo["mu_p"][:, None]
     filas = []
-    for nombre, (_, bloque) in NIVEL_2.items():
-        y = _codigo_nivel_2(datos.personas, nombre)
+    for nombre, (col, bloque) in variables.items():
+        y = _codigo_nivel_2(datos.personas, nombre, col)
         V = y.max() + 1
         real = np.bincount(y * M + idx, minlength=V * M).reshape(V, M).astype(float)
         modelo_est = indicadora(y, V) @ indicadora(modelo["perfil_de_persona"], len(modelo["mu_p"])).T @ reparto
